@@ -4,7 +4,7 @@
 # heavily based on EphemPy by Raymond L. Buvel
 
 ephemNumber = '405'
-asciiDir = '..' #where to find the ascii files
+asciiDir = '.' #where to find the ascii files
 
 # This automatically selects an output file name based on the ephemeris.  If
 # you don't like this convention, change it here.
@@ -22,6 +22,7 @@ fp = open(outFileName,'wb')
 fp.close()
 
 dbase = sqlite3.connect(outFileName)
+dbase.execute("pragma foreign_keys=on")
 dbase.execute("create table metadata(name TEXT, value TEXT)")
 
 #A table to hold object data
@@ -36,14 +37,19 @@ dbase.execute("create table metadata(name TEXT, value TEXT)")
 #This means that the number of members in each record
 #is the sum over all the objects of ncoeffs * 3(dimensions) * ngranules +2
 #the +2 because the start time and the end time are the first two values
-dbase.execute("create table objects(objectid INTEGER PRIMARY KEY, shortname TEXT, longname TEXT,offset INTEGER, ncoeffs INTEGER, ngranules INTEGER, ndim INTEGER)") 
+dbase.execute("create table objects(objectID INTEGER PRIMARY KEY, shortname TEXT, longname TEXT,offset INTEGER, ncoeffs INTEGER, ngranules INTEGER, ndim INTEGER)") 
 
 #a table to hold the constants
 dbase.execute("create table constants(name TEXT, value REAL)")
 
-#A table to hold the data
-dbase.execute("create table positiondata(recordID INTEGER PRIMARY KEY,tstart REAL, tend REAL, coeffdata BLOB)")
+#A table to hold the data (the old way)
+#dbase.execute("create table positiondata(recordID INTEGER PRIMARY KEY,tstart REAL, tend REAL, coeffdata BLOB)")
 #the blob will contain approx 1018 double in intel byte order 
+
+dbase.execute("create table records(recordID INTEGER PRIMARY KEY, tstart REAL, tend REAL)");
+dbase.execute("create table positiondata (recordID INTEGER, objectID INTEGER, coeffdata BLOB, FOREIGN KEY(recordID) REFERENCES records(recordID),FOREIGN KEY(objectID) REFERENCES objects(objectID))")
+
+
 
 dbase.commit()
 
@@ -108,11 +114,14 @@ def invalidGroup(name):
 
 #dbase.execute('insert into metadata values (?,?)',('jevon','was here'))
 
-datarecord  = []
-k=0
 
-for line in fileinput.input(files):
-    
+inputstream = fileinput.input(files)
+
+
+while True:
+    line = inputstream.readline()
+    if line=='':
+        raise "I got to the end of the input data before the headers were even over" 
     line = line.strip()
     if not line:
         # Skip blank lines
@@ -120,37 +129,12 @@ for line in fileinput.input(files):
     if curGroup != '1070':
         processHeader(line)
     else:
-        #break putting a break in here stops parsing at data, good for debugging
-        line=line.replace('D','e')
-        nums = line.split()
-        if len(nums)==2:
-            #new record
-            if arraySize != int(nums[1]):
-                raise ValueError('Invalid array size')
-            if (k%50)==0:
-                print "Processed %d records" % (k)
-            if datarecord: #we have some data to save to database
-                assert((len(datarecord)-arraySize<=2) and (len(datarecord)>=arraySize))
-                tstart = datarecord[0]
-                tend = datarecord[1]
-                datablob = sqlite3.Binary(struct.pack('!%dd'%(len(datarecord[2:arraySize])),*datarecord[2:arraySize]))
-                dbase.execute('insert into positiondata values (?,?,?,?)',(k,tstart,tend,datablob))
-                k=k+1
-                datarecord=[]
-        elif len(nums) == 3:
-            datarecord.extend([float(x) for x in nums])
-        else:
-            raise ValueError('Invalid data line')
-    
-if datarecord: #we have some data to save to database
-     tstart = datarecord[0]
-     tend = datarecord[1]
-     datablob = sqlite3.Binary(struct.pack('!%dd'%(len(datarecord[2:arraySize])),*datarecord[2:arraySize]))
-     dbase.execute('insert into positiondata values (?,?,?,?)',(k,tstart,tend,datablob))
-     k=k+1
+        break
+
+
            
 ############
-#put in the header information
+#put in the header information to the databse
 ##########
 
 #header 1030 is timevals, putting them in as strings
@@ -191,9 +175,9 @@ for h in header['1050']:
     structdata.extend(map(int,h.split()))
 
 assert(len(structdata)%3==0)
-nbodies=len(structdata)/3
+nobjects=len(structdata)/3
 
-assert(nbodies==13)
+assert(nobjects==13)
 
 names=[
 ['mercury','Mercury'],
@@ -211,13 +195,13 @@ names=[
 ['librations','Librations']
 ]
 
-offsets = structdata[0:nbodies]
-ncoeffs = structdata[nbodies:(2*nbodies)]
-ngranules = structdata[(2*nbodies):(3*nbodies)]
+offsets = structdata[0:nobjects]
+ncoeffs = structdata[nobjects:(2*nobjects)]
+ngranules = structdata[(2*nobjects):(3*nobjects)]
 
 ndim = []
 
-for k in range(nbodies):
+for k in range(nobjects):
     ndim.append(3)
 
 #the 'body' 'nutation' only has 2 degrees of freedom (euler angles) i think?
@@ -233,12 +217,61 @@ for k in range(len(offsets)):
     
 assert(totalparameters==1018)
 
-for k in range(nbodies):
+for k in range(nobjects):
     dbase.execute('insert into objects values (?,?,?,?,?,?,?)',(k+1,names[k][0],names[k][1],offsets[k],ncoeffs[k],ngranules[k],ndim[k]))
 
 
 
+###########################################################################
+## Put in all the data
+###########################################################################
+datarecord  = []
+k=0
 
+while True:
+    line = inputstream.readline()
+    nums = line.split()
+    if line=='' or len(nums)==2: #we have either finished the file or started a new record
+        if (k%500)==0:
+            print "Processed %d records" % (k)
+            dbase.commit() #cant hurt?
+        if datarecord: #we have some data to save to database
+            assert((len(datarecord)-arraySize<=2) and (len(datarecord)>=arraySize))
+            tstart = datarecord[0]
+            tend = datarecord[1]
+            #this puts the records into positiondata as one big datablob (the oldway)
+            #datablob = sqlite3.Binary(struct.pack('!%dd'%(len(datarecord[2:arraySize])),*datarecord[2:arraySize]))
+#            dbase.execute('insert into positiondata values (?,?,?,?)',(k,tstart,tend,datablob))
+            #this puts the start and end times into the table 'records' and puts positiondata into positiondata
+            #one row per object per record
+            datarecord = datarecord[2:arraySize]
+            dbase.execute("insert into records values (?,?,?)",(k,tstart,tend))
+            for m in range(nobjects):
+                bloboffset = offsets[m]
+                bloblength = ndim[m]*ncoeffs[m]*ngranules[m]
+                datablob = sqlite3.Binary((struct.pack('!%dd'%(bloblength),*datarecord[bloboffset:(bloboffset+bloblength)])))
+                dbase.execute("insert into positiondata values (?,?,?)",(k,m+1,datablob))
+            #dbase.execute("create table records(recordID INTEGER PRIMARY KEY, tstart REAL, tend REAL)");
+            #dbase.execute("create table positiondata(FOREIGN KEY recordID REFERENCES records(recordID),FOREIGN KEY(objectID) REFERENCES objects(objectID), coeffdata BLOB)")
+            k=k+1
+            datarecord=[]
+        if line=='': #we are at the end of the file and therefore all done
+            break
+        else:
+            assert(arraySize==int(nums[1])) #we must be at the start of the next data record
+    else: #where in the middle of a record
+        line=line.replace('D','e')
+        nums = line.split()
+        assert(len(nums)==3)#there records are made of lines of three numbers
+        datarecord.extend([float(x) for x in nums])
+
+dbase.commit()
+
+
+print 'making indexes'
+dbase.execute('CREATE INDEX posdataidx ON positiondata(objectID,recordID)')
+dbase.execute('CREATE INDEX recordidx ON records(tstart)')
+       
 
 
 dbase.commit()
